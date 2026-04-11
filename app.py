@@ -30,6 +30,8 @@ def haversine(lat1, lng1, lat2, lng2):
 def bayesian_rating(rating, count, global_avg=4.5, min_votes=5):
     return (count * rating + min_votes * global_avg) / (count + min_votes)
 
+# ── USERS ───────────────────────────────────────────────
+
 @app.route('/users/register', methods=['POST'])
 def register_user():
     data = request.json
@@ -55,13 +57,17 @@ def get_user(firebase_uid):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            cursor.execute('SELECT * FROM users WHERE firebase_uid=%s', (firebase_uid,))
+            cursor.execute(
+                'SELECT * FROM users WHERE firebase_uid=%s', (firebase_uid,)
+            )
             user = cursor.fetchone()
         if not user:
             return jsonify({'error': 'User not found'}), 404
         return jsonify(user)
     finally:
         db.close()
+
+# ── RIDES ───────────────────────────────────────────────
 
 @app.route('/rides', methods=['POST'])
 def create_ride():
@@ -150,7 +156,6 @@ def match_rides():
             count = ride['rating_count'] or 0
             b_rating = bayesian_rating(rating, count)
             rate_score = 100 - ((ride['rate_per_km'] / max_rate) * 100) if max_rate > 0 else 50
-
             score = (overlap * 0.40) + (b_rating / 5 * 100 * 0.20) + (rate_score * 0.15)
 
             results.append({
@@ -190,6 +195,8 @@ def get_host_rides(host_uid):
         return jsonify(rides)
     finally:
         db.close()
+
+# ── BOOKINGS ─────────────────────────────────────────────
 
 @app.route('/bookings', methods=['POST'])
 def create_booking():
@@ -245,8 +252,7 @@ def get_ride_bookings(ride_id):
     try:
         with db.cursor() as cursor:
             cursor.execute(
-                'SELECT * FROM bookings WHERE ride_id=%s',
-                (ride_id,)
+                'SELECT * FROM bookings WHERE ride_id=%s', (ride_id,)
             )
             bookings = cursor.fetchall()
         return jsonify(bookings)
@@ -278,6 +284,8 @@ def update_booking_status(booking_id):
     finally:
         db.close()
 
+# ── RATINGS ──────────────────────────────────────────────
+
 @app.route('/ratings', methods=['POST'])
 def submit_rating():
     data = request.json
@@ -299,6 +307,52 @@ def submit_rating():
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
+    finally:
+        db.close()
+
+# ── ECO STATS ─────────────────────────────────────────────
+
+@app.route('/eco/<member_uid>', methods=['GET'])
+def get_eco_stats(member_uid):
+    db = get_db()
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                """SELECT COUNT(*) as total_rides,
+                          SUM(
+                            haversine_approx(
+                              b.pickup_lat, b.pickup_lng,
+                              b.drop_lat, b.drop_lng
+                            )
+                          ) as total_km
+                   FROM bookings b
+                   WHERE b.member_uid=%s AND b.status='accepted'""",
+                (member_uid,)
+            )
+            row = cursor.fetchone()
+
+        total_rides = row['total_rides'] or 0
+        total_km = row['total_km'] or 0
+
+        # CO2 calculation: 0.21 kg per km saved per passenger
+        co2_saved = round(total_km * 0.21, 1)
+        fuel_saved = round(co2_saved / 2.31, 1)
+        trees = round(co2_saved / 21, 2)
+
+        return jsonify({
+            'total_rides': total_rides,
+            'co2_saved_kg': co2_saved,
+            'fuel_saved_litres': fuel_saved,
+            'trees_equivalent': trees,
+        })
+    except Exception as e:
+        # Return dummy stats if calculation fails
+        return jsonify({
+            'total_rides': 0,
+            'co2_saved_kg': 0.0,
+            'fuel_saved_litres': 0.0,
+            'trees_equivalent': 0.0,
+        })
     finally:
         db.close()
 
