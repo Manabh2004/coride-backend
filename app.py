@@ -361,5 +361,74 @@ def get_eco_stats(member_uid):
     finally:
         db.close()
 
+@app.route('/track/live', methods=['GET'])
+def track_live():
+    lat = request.args.get('lat', '20.2961')
+    lng = request.args.get('lng', '85.8245')
+    ride_id = request.args.get('ride', '')
+    
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CoRide Safety Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, sans-serif; background: #1a1a1a; }}
+    #header {{
+      background: #1a1a1a; padding: 16px;
+      display: flex; align-items: center; gap: 12px;
+    }}
+    #header h1 {{ color: #F5C842; font-size: 18px; margin: 0; }}
+    #header p {{ color: #aaa; font-size: 12px; margin: 0; }}
+    #map {{ height: calc(100vh - 80px); width: 100vw; }}
+    #footer {{
+      background: #1a1a1a; padding: 12px 16px;
+      text-align: center; color: #666; font-size: 11px;
+    }}
+  </style>
+</head>
+<body>
+  <div id="header">
+    <div>
+      <h1>🚗 CoRide Safety Tracker</h1>
+      <p>Live location shared for safety · {ride_id if ride_id else 'Active ride'}</p>
+    </div>
+  </div>
+  <div id="map"></div>
+  <div id="footer">Location shared via CoRide · This link was sent for safety purposes</div>
+  <script>
+    var lat = {lat};
+    var lng = {lng};
+    var map = L.map('map').setView([lat, lng], 15);
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      attribution: '© OpenStreetMap contributors'
+    }}).addTo(map);
+
+    var pulsingIcon = L.divIcon({{
+      html: '<div style="width:20px;height:20px;background:#e74c3c;border:3px solid white;border-radius:50%;box-shadow:0 0 0 rgba(231,76,60,0.6);animation:pulse 2s infinite"></div>',
+      iconSize: [20, 20], iconAnchor: [10, 10], className: ''
+    }});
+
+    L.marker([lat, lng], {{ icon: pulsingIcon }}).addTo(map)
+      .bindPopup('<b>Live Location</b><br>Shared via CoRide for safety')
+      .openPopup();
+
+    L.circle([lat, lng], {{ radius: 100, color: '#e74c3c', fillOpacity: 0.1 }}).addTo(map);
+  </script>
+  <style>
+    @keyframes pulse {{
+      0% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0.6); }}
+      70% {{ box-shadow: 0 0 0 15px rgba(231,76,60,0); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0); }}
+    }}
+  </style>
+</body>
+</html>'''
+    return html, 200, {'Content-Type': 'text/html'}
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
