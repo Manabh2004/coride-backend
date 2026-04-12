@@ -93,7 +93,77 @@ def bayesian_rating(rating, count, global_avg=4.5, min_votes=5):
 def row_to_dict(row):
     return dict(zip(row.keys(), row))
 
-# ── USERS ────────────────────────────────────────────────
+# ── PING (keeps Render awake via UptimeRobot) ─────────────
+
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({'status': 'alive'})
+
+# ── TRACK PAGE ────────────────────────────────────────────
+
+@app.route('/track/live', methods=['GET'])
+def track_live():
+    lat = request.args.get('lat', '20.2961')
+    lng = request.args.get('lng', '85.8245')
+    ride_id = request.args.get('ride', '')
+
+    html = f'''<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CoRide Safety Tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{ font-family: -apple-system, sans-serif; background: #1a1a1a; }}
+    #header {{ background: #1a1a1a; padding: 16px; }}
+    #header h1 {{ color: #F5C842; font-size: 18px; margin: 0 0 4px; }}
+    #header p {{ color: #aaa; font-size: 12px; margin: 0; }}
+    #map {{ height: calc(100vh - 80px); width: 100vw; }}
+    #footer {{ background: #1a1a1a; padding: 12px 16px; text-align: center; color: #666; font-size: 11px; }}
+    @keyframes pulse {{
+      0% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0.6); }}
+      70% {{ box-shadow: 0 0 0 15px rgba(231,76,60,0); }}
+      100% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0); }}
+    }}
+    .pulse-dot {{
+      width: 20px; height: 20px;
+      background: #e74c3c; border: 3px solid white;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }}
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>🚗 CoRide Safety Tracker</h1>
+    <p>Live location shared for safety · {ride_id if ride_id else 'Active ride'}</p>
+  </div>
+  <div id="map"></div>
+  <div id="footer">Location shared via CoRide for safety purposes</div>
+  <script>
+    var lat = {lat};
+    var lng = {lng};
+    var map = L.map('map').setView([lat, lng], 15);
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      attribution: '© OpenStreetMap contributors'
+    }}).addTo(map);
+    var icon = L.divIcon({{
+      html: '<div class="pulse-dot"></div>',
+      iconSize: [20, 20], iconAnchor: [10, 10], className: ''
+    }});
+    L.marker([lat, lng], {{ icon: icon }}).addTo(map)
+      .bindPopup('<b>Live Location</b><br>Shared via CoRide for safety')
+      .openPopup();
+    L.circle([lat, lng], {{ radius: 100, color: '#e74c3c', fillOpacity: 0.1 }}).addTo(map);
+  </script>
+</body>
+</html>'''
+    return html, 200, {'Content-Type': 'text/html'}
+
+# ── USERS ─────────────────────────────────────────────────
 
 @app.route('/users/register', methods=['POST'])
 def register_user():
@@ -166,6 +236,7 @@ def match_rides():
 
     db = get_db()
     try:
+        # Also exclude rides where this member already has a pending/accepted booking
         rows = db.execute(
             '''SELECT r.*, u.rating, u.rating_count
                FROM rides r
@@ -173,8 +244,13 @@ def match_rides():
                WHERE r.status='active'
                AND r.available_seats > 0
                AND r.rate_per_km <= ?
-               AND r.host_uid != ?''',
-            (max_rate, member_uid)
+               AND r.host_uid != ?
+               AND r.id NOT IN (
+                   SELECT ride_id FROM bookings
+                   WHERE member_uid = ?
+                   AND status IN ('pending', 'accepted')
+               )''',
+            (max_rate, member_uid, member_uid)
         ).fetchall()
 
         results = []
@@ -186,7 +262,10 @@ def match_rides():
 
             p2o = haversine(pickup_lat, pickup_lng, ride['origin_lat'], ride['origin_lng'])
             p2d = haversine(pickup_lat, pickup_lng, ride['destination_lat'], ride['destination_lng'])
-            route_len = haversine(ride['origin_lat'], ride['origin_lng'], ride['destination_lat'], ride['destination_lng'])
+            route_len = haversine(
+                ride['origin_lat'], ride['origin_lng'],
+                ride['destination_lat'], ride['destination_lng']
+            )
 
             detour = max(0, p2o + p2d - route_len)
             if detour > 3:
@@ -227,7 +306,8 @@ def get_host_rides(host_uid):
     db = get_db()
     try:
         rows = db.execute(
-            'SELECT * FROM rides WHERE host_uid=? ORDER BY created_at DESC', (host_uid,)
+            'SELECT * FROM rides WHERE host_uid=? ORDER BY created_at DESC',
+            (host_uid,)
         ).fetchall()
         return jsonify([row_to_dict(r) for r in rows])
     finally:
@@ -240,17 +320,42 @@ def create_booking():
     data = request.json
     db = get_db()
     try:
+        # Check if member already has an active booking on this ride
+        existing = db.execute(
+            '''SELECT id FROM bookings
+               WHERE ride_id=? AND member_uid=?
+               AND status IN ('pending', 'accepted')''',
+            (data['ride_id'], data['member_uid'])
+        ).fetchone()
+
+        if existing:
+            return jsonify({'error': 'You already have a booking on this ride'}), 400
+
+        # Check if ride still has seats
+        ride = db.execute(
+            'SELECT available_seats FROM rides WHERE id=?',
+            (data['ride_id'],)
+        ).fetchone()
+
+        if not ride or ride['available_seats'] <= 0:
+            return jsonify({'error': 'No seats available on this ride'}), 400
+
         db.execute(
             '''INSERT INTO bookings
                (ride_id, member_uid, member_name,
                 pickup_address, pickup_lat, pickup_lng,
                 drop_address, drop_lat, drop_lng)
                VALUES (?,?,?,?,?,?,?,?,?)''',
-            (data['ride_id'], data['member_uid'], data['member_name'],
-             data['pickup_address'], data['pickup_lat'], data['pickup_lng'],
-             data['drop_address'], data['drop_lat'], data['drop_lng'])
+            (
+                data['ride_id'], data['member_uid'], data['member_name'],
+                data['pickup_address'], data['pickup_lat'], data['pickup_lng'],
+                data['drop_address'], data['drop_lat'], data['drop_lng'],
+            )
         )
-        db.execute('UPDATE rides SET available_seats = available_seats - 1 WHERE id=?', (data['ride_id'],))
+        db.execute(
+            'UPDATE rides SET available_seats = available_seats - 1 WHERE id=?',
+            (data['ride_id'],)
+        )
         db.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -291,11 +396,19 @@ def update_booking_status(booking_id):
     data = request.json
     db = get_db()
     try:
-        db.execute('UPDATE bookings SET status=? WHERE id=?', (data['status'], booking_id))
+        db.execute(
+            'UPDATE bookings SET status=? WHERE id=?',
+            (data['status'], booking_id)
+        )
         if data['status'] == 'rejected':
-            row = db.execute('SELECT ride_id FROM bookings WHERE id=?', (booking_id,)).fetchone()
+            row = db.execute(
+                'SELECT ride_id FROM bookings WHERE id=?', (booking_id,)
+            ).fetchone()
             if row:
-                db.execute('UPDATE rides SET available_seats = available_seats + 1 WHERE id=?', (row['ride_id'],))
+                db.execute(
+                    'UPDATE rides SET available_seats = available_seats + 1 WHERE id=?',
+                    (row['ride_id'],)
+                )
         db.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -344,7 +457,10 @@ def get_eco_stats(member_uid):
         total_km = 0
         for row in rows:
             r = row_to_dict(row)
-            total_km += haversine(r['pickup_lat'], r['pickup_lng'], r['drop_lat'], r['drop_lng'])
+            total_km += haversine(
+                r['pickup_lat'], r['pickup_lng'],
+                r['drop_lat'], r['drop_lng']
+            )
 
         co2_saved = round(total_km * 0.21, 1)
         fuel_saved = round(co2_saved / 2.31, 1)
@@ -357,82 +473,14 @@ def get_eco_stats(member_uid):
             'trees_equivalent': trees,
         })
     except Exception as e:
-        return jsonify({'total_rides': 0, 'co2_saved_kg': 0.0, 'fuel_saved_litres': 0.0, 'trees_equivalent': 0.0})
+        return jsonify({
+            'total_rides': 0,
+            'co2_saved_kg': 0.0,
+            'fuel_saved_litres': 0.0,
+            'trees_equivalent': 0.0,
+        })
     finally:
         db.close()
 
-@app.route('/track/live', methods=['GET'])
-def track_live():
-    lat = request.args.get('lat', '20.2961')
-    lng = request.args.get('lng', '85.8245')
-    ride_id = request.args.get('ride', '')
-    
-    html = f'''<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CoRide Safety Tracker</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <style>
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{ font-family: -apple-system, sans-serif; background: #1a1a1a; }}
-    #header {{
-      background: #1a1a1a; padding: 16px;
-      display: flex; align-items: center; gap: 12px;
-    }}
-    #header h1 {{ color: #F5C842; font-size: 18px; margin: 0; }}
-    #header p {{ color: #aaa; font-size: 12px; margin: 0; }}
-    #map {{ height: calc(100vh - 80px); width: 100vw; }}
-    #footer {{
-      background: #1a1a1a; padding: 12px 16px;
-      text-align: center; color: #666; font-size: 11px;
-    }}
-  </style>
-</head>
-<body>
-  <div id="header">
-    <div>
-      <h1>🚗 CoRide Safety Tracker</h1>
-      <p>Live location shared for safety · {ride_id if ride_id else 'Active ride'}</p>
-    </div>
-  </div>
-  <div id="map"></div>
-  <div id="footer">Location shared via CoRide · This link was sent for safety purposes</div>
-  <script>
-    var lat = {lat};
-    var lng = {lng};
-    var map = L.map('map').setView([lat, lng], 15);
-    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-      attribution: '© OpenStreetMap contributors'
-    }}).addTo(map);
-
-    var pulsingIcon = L.divIcon({{
-      html: '<div style="width:20px;height:20px;background:#e74c3c;border:3px solid white;border-radius:50%;box-shadow:0 0 0 rgba(231,76,60,0.6);animation:pulse 2s infinite"></div>',
-      iconSize: [20, 20], iconAnchor: [10, 10], className: ''
-    }});
-
-    L.marker([lat, lng], {{ icon: pulsingIcon }}).addTo(map)
-      .bindPopup('<b>Live Location</b><br>Shared via CoRide for safety')
-      .openPopup();
-
-    L.circle([lat, lng], {{ radius: 100, color: '#e74c3c', fillOpacity: 0.1 }}).addTo(map);
-  </script>
-  <style>
-    @keyframes pulse {{
-      0% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0.6); }}
-      70% {{ box-shadow: 0 0 0 15px rgba(231,76,60,0); }}
-      100% {{ box-shadow: 0 0 0 0 rgba(231,76,60,0); }}
-    }}
-  </style>
-</body>
-</html>'''
-    return html, 200, {'Content-Type': 'text/html'}
-
-@app.route('/ping', methods=['GET'])
-def ping():
-    return jsonify({'status': 'alive'})
-    
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
