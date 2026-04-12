@@ -430,5 +430,9 @@ def track_live():
 </html>'''
     return html, 200, {'Content-Type': 'text/html'}
 
+@app.route('/ping', methods=['GET'])
+def ping():
+    return jsonify({'status': 'alive'})
+    
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
