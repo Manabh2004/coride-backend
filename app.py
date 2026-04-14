@@ -3,7 +3,8 @@ from flask_cors import CORS
 import sqlite3
 import math
 import os
-from datetime import datetime, timedelta
+import json
+import urllib.request
 
 app = Flask(__name__)
 CORS(app)
@@ -30,6 +31,12 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS push_tokens (
+            firebase_uid TEXT PRIMARY KEY,
+            push_token TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS rides (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             host_uid TEXT NOT NULL,
@@ -49,6 +56,7 @@ def init_db():
             auto_accept INTEGER DEFAULT 0,
             min_rating_required REAL DEFAULT 0.0,
             min_vouches_required INTEGER DEFAULT 0,
+            require_network_vouch INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -102,11 +110,20 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(from_uid, to_uid)
         );
+
+        CREATE TABLE IF NOT EXISTS live_locations (
+            ride_id TEXT PRIMARY KEY,
+            lat REAL NOT NULL,
+            lng REAL NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     ''')
     db.commit()
     db.close()
 
 init_db()
+
+# ── HELPERS ───────────────────────────────────────────────
 
 def haversine(lat1, lng1, lat2, lng2):
     R = 6371
@@ -124,6 +141,41 @@ def bayesian_rating(rating, count, global_avg=4.5, min_votes=5):
 def row_to_dict(row):
     return dict(zip(row.keys(), row))
 
+def get_push_token(firebase_uid):
+    db = get_db()
+    try:
+        row = db.execute(
+            'SELECT push_token FROM push_tokens WHERE firebase_uid=?',
+            (firebase_uid,)
+        ).fetchone()
+        return row['push_token'] if row else None
+    finally:
+        db.close()
+
+def send_push_notification(push_token, title, body, data=None):
+    if not push_token:
+        return
+    try:
+        payload = json.dumps({
+            'to': push_token,
+            'title': title,
+            'body': body,
+            'data': data or {},
+            'sound': 'default',
+            'priority': 'high',
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            'https://exp.host/--/api/v2/push/send',
+            data=payload,
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+            }
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f'Push notification failed: {e}')
+
 # ── PING ─────────────────────────────────────────────────
 
 @app.route('/ping', methods=['GET'])
@@ -137,49 +189,128 @@ def track_live():
     lat = request.args.get('lat', '20.2961')
     lng = request.args.get('lng', '85.8245')
     ride_id = request.args.get('ride', '')
+
+    if ride_id:
+        db = get_db()
+        try:
+            row = db.execute(
+                'SELECT lat, lng FROM live_locations WHERE ride_id=?',
+                (ride_id,)
+            ).fetchone()
+            if row:
+                lat = str(row['lat'])
+                lng = str(row['lng'])
+        except Exception:
+            pass
+        finally:
+            db.close()
+
     html = f'''<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CoRide Safety Tracker</title>
+  <title>CoRide Live Tracker</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     *{{margin:0;padding:0;box-sizing:border-box}}
     body{{font-family:-apple-system,sans-serif;background:#1a1a1a}}
-    #header{{background:#1a1a1a;padding:16px}}
-    #header h1{{color:#F5C842;font-size:18px;margin:0 0 4px}}
-    #header p{{color:#aaa;font-size:12px;margin:0}}
-    #map{{height:calc(100vh - 80px);width:100vw}}
-    #footer{{background:#1a1a1a;padding:12px;text-align:center;color:#666;font-size:11px}}
+    #header{{background:#1a1a1a;padding:14px 16px;display:flex;justify-content:space-between;align-items:center}}
+    #header h1{{color:#F5C842;font-size:16px;margin:0}}
+    #status{{color:#aaa;font-size:11px}}
+    #map{{height:calc(100vh - 48px);width:100vw}}
     @keyframes pulse{{
       0%{{box-shadow:0 0 0 0 rgba(231,76,60,.6)}}
       70%{{box-shadow:0 0 0 15px rgba(231,76,60,0)}}
       100%{{box-shadow:0 0 0 0 rgba(231,76,60,0)}}
     }}
-    .dot{{width:20px;height:20px;background:#e74c3c;border:3px solid white;border-radius:50%;animation:pulse 2s infinite}}
+    .dot{{width:18px;height:18px;background:#e74c3c;border:3px solid white;
+          border-radius:50%;animation:pulse 2s infinite}}
   </style>
 </head>
 <body>
   <div id="header">
-    <h1>🚗 CoRide Safety Tracker</h1>
-    <p>Live location shared for safety · {ride_id if ride_id else 'Active ride'}</p>
+    <h1>🚗 CoRide Live Tracker</h1>
+    <span id="status">Connecting...</span>
   </div>
   <div id="map"></div>
-  <div id="footer">Shared via CoRide for safety purposes</div>
   <script>
+    var rideId = '{ride_id}';
     var map = L.map('map').setView([{lat},{lng}],15);
     L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
       {{attribution:'© OpenStreetMap contributors'}}).addTo(map);
-    L.marker([{lat},{lng}],{{icon:L.divIcon({{html:'<div class="dot"></div>',
-      iconSize:[20,20],iconAnchor:[10,10],className:''}})
-    }}).addTo(map).bindPopup('Live Location — shared via CoRide').openPopup();
-    L.circle([{lat},{lng}],{{radius:100,color:'#e74c3c',fillOpacity:.1}}).addTo(map);
+
+    var marker = L.marker([{lat},{lng}],{{
+      icon:L.divIcon({{html:'<div class="dot"></div>',
+        iconSize:[18,18],iconAnchor:[9,9],className:''}})
+    }}).addTo(map).bindPopup('Live location').openPopup();
+
+    var statusEl = document.getElementById('status');
+    var lastUpdate = Date.now();
+
+    function fetchLocation() {{
+      if (!rideId) return;
+      fetch('/location/current/' + rideId)
+        .then(r => r.json())
+        .then(data => {{
+          if (data.lat && data.lng) {{
+            marker.setLatLng([data.lat, data.lng]);
+            map.panTo([data.lat, data.lng]);
+            lastUpdate = Date.now();
+            statusEl.textContent = 'Live · just updated';
+          }}
+        }})
+        .catch(() => {{}});
+    }}
+
+    setInterval(fetchLocation, 30000);
+    setInterval(function() {{
+      var secs = Math.round((Date.now() - lastUpdate) / 1000);
+      statusEl.textContent = secs < 60
+        ? 'Updated ' + secs + 's ago'
+        : 'Updated ' + Math.round(secs/60) + 'm ago';
+    }}, 1000);
+
+    fetchLocation();
   </script>
 </body>
 </html>'''
     return html, 200, {'Content-Type': 'text/html'}
+
+@app.route('/location/update', methods=['POST'])
+def update_location():
+    data = request.json
+    db = get_db()
+    try:
+        db.execute(
+            '''INSERT INTO live_locations (ride_id, lat, lng)
+               VALUES (?,?,?)
+               ON CONFLICT(ride_id) DO UPDATE SET
+               lat=excluded.lat, lng=excluded.lng,
+               updated_at=CURRENT_TIMESTAMP''',
+            (str(data['ride_id']), data['lat'], data['lng'])
+        )
+        db.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+    finally:
+        db.close()
+
+@app.route('/location/current/<ride_id>', methods=['GET'])
+def get_current_location(ride_id):
+    db = get_db()
+    try:
+        row = db.execute(
+            'SELECT lat, lng, updated_at FROM live_locations WHERE ride_id=?',
+            (str(ride_id),)
+        ).fetchone()
+        if not row:
+            return jsonify({'error': 'No location yet'}), 404
+        return jsonify({'lat': row['lat'], 'lng': row['lng'], 'updated_at': row['updated_at']})
+    finally:
+        db.close()
 
 # ── USERS ─────────────────────────────────────────────────
 
@@ -191,7 +322,8 @@ def register_user():
         db.execute(
             '''INSERT INTO users (firebase_uid, name, email, phone)
                VALUES (?,?,?,?)
-               ON CONFLICT(firebase_uid) DO UPDATE SET name=excluded.name, phone=excluded.phone''',
+               ON CONFLICT(firebase_uid) DO UPDATE SET
+               name=excluded.name, phone=excluded.phone''',
             (data['firebase_uid'], data['name'], data['email'], data['phone'])
         )
         db.commit()
@@ -205,27 +337,27 @@ def register_user():
 def get_user(firebase_uid):
     db = get_db()
     try:
-        row = db.execute('SELECT * FROM users WHERE firebase_uid=?', (firebase_uid,)).fetchone()
+        row = db.execute(
+            'SELECT * FROM users WHERE firebase_uid=?', (firebase_uid,)
+        ).fetchone()
         if not row:
             return jsonify({'error': 'User not found'}), 404
         return jsonify(row_to_dict(row))
     finally:
         db.close()
 
-# ── VOUCHES ───────────────────────────────────────────────
-
-@app.route('/vouches', methods=['POST'])
-def add_vouch():
+@app.route('/users/register-token', methods=['POST'])
+def register_push_token():
     data = request.json
     db = get_db()
     try:
         db.execute(
-            'INSERT OR IGNORE INTO vouches (from_uid, to_uid) VALUES (?,?)',
-            (data['from_uid'], data['to_uid'])
-        )
-        db.execute(
-            'UPDATE users SET vouch_count = vouch_count + 1 WHERE firebase_uid=?',
-            (data['to_uid'],)
+            '''INSERT INTO push_tokens (firebase_uid, push_token)
+               VALUES (?,?)
+               ON CONFLICT(firebase_uid) DO UPDATE SET
+               push_token=excluded.push_token,
+               updated_at=CURRENT_TIMESTAMP''',
+            (data['firebase_uid'], data['push_token'])
         )
         db.commit()
         return jsonify({'success': True})
@@ -234,32 +366,74 @@ def add_vouch():
     finally:
         db.close()
 
-@app.route('/vouches/check', methods=['POST'])
-def check_vouch():
-    """Check if viewer has vouched, and if anyone viewer vouched has vouched target"""
+# ── VOUCHES ───────────────────────────────────────────────
+
+@app.route('/vouches', methods=['POST'])
+def add_vouch():
     data = request.json
-    viewer_uid = data['viewer_uid']
-    target_uid = data['target_uid']
+    from_uid = data['from_uid']
+    to_uid = data['to_uid']
+    if from_uid == to_uid:
+        return jsonify({'error': 'Cannot vouch for yourself'}), 400
     db = get_db()
     try:
-        # Direct vouch
+        existing = db.execute(
+            'SELECT id FROM vouches WHERE from_uid=? AND to_uid=?',
+            (from_uid, to_uid)
+        ).fetchone()
+        if existing:
+            db.execute('DELETE FROM vouches WHERE from_uid=? AND to_uid=?', (from_uid, to_uid))
+            db.execute(
+                'UPDATE users SET vouch_count=MAX(0,vouch_count-1) WHERE firebase_uid=?',
+                (to_uid,)
+            )
+            db.commit()
+            return jsonify({'success': True, 'action': 'removed'})
+        else:
+            db.execute('INSERT INTO vouches (from_uid, to_uid) VALUES (?,?)', (from_uid, to_uid))
+            db.execute(
+                'UPDATE users SET vouch_count=vouch_count+1 WHERE firebase_uid=?',
+                (to_uid,)
+            )
+            db.commit()
+            return jsonify({'success': True, 'action': 'added'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+    finally:
+        db.close()
+
+@app.route('/vouches/details/<target_uid>', methods=['GET'])
+def get_vouch_details(target_uid):
+    viewer_uid = request.args.get('viewer_uid', '')
+    db = get_db()
+    try:
+        user = db.execute(
+            'SELECT vouch_count FROM users WHERE firebase_uid=?', (target_uid,)
+        ).fetchone()
+        total = user['vouch_count'] if user else 0
+
         direct = db.execute(
             'SELECT id FROM vouches WHERE from_uid=? AND to_uid=?',
             (viewer_uid, target_uid)
         ).fetchone()
 
-        # Indirect vouch (someone viewer vouched has vouched target)
-        indirect = db.execute(
-            '''SELECT v2.from_uid FROM vouches v1
+        network_rows = db.execute(
+            '''SELECT u.name, u.firebase_uid
+               FROM vouches v1
                JOIN vouches v2 ON v1.to_uid = v2.from_uid
-               WHERE v1.from_uid=? AND v2.to_uid=?''',
+               JOIN users u ON u.firebase_uid = v1.to_uid
+               WHERE v1.from_uid=? AND v2.to_uid=?
+               LIMIT 5''',
             (viewer_uid, target_uid)
-        ).fetchone()
+        ).fetchall()
+
+        network = [row_to_dict(r) for r in network_rows]
 
         return jsonify({
-            'direct': direct is not None,
-            'indirect': indirect is not None,
-            'indirect_via': row_to_dict(indirect)['from_uid'] if indirect else None,
+            'total_vouches': total,
+            'viewer_vouched': direct is not None,
+            'network_vouchers': network,
+            'network_count': len(network),
         })
     finally:
         db.close()
@@ -277,8 +451,8 @@ def create_ride():
                 destination_address, destination_lat, destination_lng,
                 departure_time, available_seats, total_seats, rate_per_km,
                 is_recurring, recurring_days, auto_accept,
-                min_rating_required, min_vouches_required)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                min_rating_required, min_vouches_required, require_network_vouch)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (
                 data['host_uid'], data['host_name'],
                 data['origin_address'], data['origin_lat'], data['origin_lng'],
@@ -290,6 +464,7 @@ def create_ride():
                 1 if data.get('auto_accept') else 0,
                 data.get('min_rating_required', 0.0),
                 data.get('min_vouches_required', 0),
+                1 if data.get('require_network_vouch') else 0,
             )
         )
         db.commit()
@@ -335,8 +510,10 @@ def match_rides():
 
             p2o = haversine(pickup_lat, pickup_lng, ride['origin_lat'], ride['origin_lng'])
             p2d = haversine(pickup_lat, pickup_lng, ride['destination_lat'], ride['destination_lng'])
-            route_len = haversine(ride['origin_lat'], ride['origin_lng'],
-                                  ride['destination_lat'], ride['destination_lng'])
+            route_len = haversine(
+                ride['origin_lat'], ride['origin_lng'],
+                ride['destination_lat'], ride['destination_lng']
+            )
 
             detour = max(0, p2o + p2d - route_len)
             if detour > 3:
@@ -391,11 +568,9 @@ def get_host_rides(host_uid):
 
 @app.route('/searches', methods=['POST'])
 def post_search():
-    """Member posts a search — visible to hosts browsing members"""
     data = request.json
     db = get_db()
     try:
-        # Get member's rating
         user = db.execute(
             'SELECT rating, rating_count, vouch_count FROM users WHERE firebase_uid=?',
             (data['member_uid'],)
@@ -405,12 +580,10 @@ def post_search():
         vouch_count = user['vouch_count'] if user else 0
         b_rating = bayesian_rating(rating, rating_count)
 
-        # Remove old searches by this member
         db.execute(
             'DELETE FROM member_searches WHERE member_uid=?',
             (data['member_uid'],)
         )
-
         cursor = db.execute(
             '''INSERT INTO member_searches
                (member_uid, member_name, member_rating, member_vouch_count,
@@ -435,7 +608,6 @@ def post_search():
 
 @app.route('/searches/match/<int:ride_id>', methods=['GET'])
 def get_matching_members(ride_id):
-    """For a given ride, return members whose route is compatible"""
     db = get_db()
     try:
         ride = db.execute('SELECT * FROM rides WHERE id=?', (ride_id,)).fetchone()
@@ -446,30 +618,28 @@ def get_matching_members(ride_id):
         searches = db.execute(
             '''SELECT * FROM member_searches
                WHERE status='searching'
+               AND member_uid != ?
                AND member_uid NOT IN (
                    SELECT member_uid FROM bookings
                    WHERE ride_id=? AND status IN ('pending','accepted')
                )''',
-            (ride_id,)
+            (ride['host_uid'], ride_id)
         ).fetchall()
 
         results = []
         for row in searches:
             s = row_to_dict(row)
-
-            # Check if member's pickup is near the host's route
             p2o = haversine(s['pickup_lat'], s['pickup_lng'],
                            ride['origin_lat'], ride['origin_lng'])
             p2d = haversine(s['pickup_lat'], s['pickup_lng'],
                            ride['destination_lat'], ride['destination_lng'])
-            route_len = haversine(ride['origin_lat'], ride['origin_lng'],
-                                  ride['destination_lat'], ride['destination_lng'])
-
+            route_len = haversine(
+                ride['origin_lat'], ride['origin_lng'],
+                ride['destination_lat'], ride['destination_lng']
+            )
             detour = max(0, p2o + p2d - route_len)
-            if detour > 5:  # slightly more lenient for host browsing
+            if detour > 5:
                 continue
-
-            # Check rate compatibility
             if ride['rate_per_km'] > s['max_rate']:
                 continue
 
@@ -504,6 +674,7 @@ def create_booking():
     data = request.json
     db = get_db()
     try:
+        # Prevent duplicate booking
         existing = db.execute(
             '''SELECT id FROM bookings WHERE ride_id=? AND member_uid=?
                AND status IN ('pending','accepted')''',
@@ -512,15 +683,17 @@ def create_booking():
         if existing:
             return jsonify({'error': 'Already booked on this ride'}), 400
 
-        ride = db.execute('SELECT * FROM rides WHERE id=?', (data['ride_id'],)).fetchone()
+        # Check seats
+        ride = db.execute(
+            'SELECT * FROM rides WHERE id=?', (data['ride_id'],)
+        ).fetchone()
         if not ride or ride['available_seats'] <= 0:
             return jsonify({'error': 'No seats available'}), 400
         ride = row_to_dict(ride)
 
-        # Determine status based on host's auto_accept setting
+        # Determine status based on auto_accept
         status = 'pending'
         if ride['auto_accept']:
-            # Check if member meets auto-accept criteria
             member = db.execute(
                 'SELECT rating, rating_count, vouch_count FROM users WHERE firebase_uid=?',
                 (data['member_uid'],)
@@ -529,7 +702,20 @@ def create_booking():
                 b_rating = bayesian_rating(member['rating'], member['rating_count'])
                 meets_rating = b_rating >= ride['min_rating_required']
                 meets_vouches = member['vouch_count'] >= ride['min_vouches_required']
-                if meets_rating and meets_vouches:
+                meets_network = True
+                if ride['require_network_vouch']:
+                    network = db.execute(
+                        '''SELECT v2.from_uid FROM vouches v1
+                           JOIN vouches v2 ON v1.to_uid = v2.from_uid
+                           WHERE v1.from_uid=? AND v2.to_uid=? LIMIT 1''',
+                        (ride['host_uid'], data['member_uid'])
+                    ).fetchone()
+                    direct = db.execute(
+                        'SELECT id FROM vouches WHERE from_uid=? AND to_uid=?',
+                        (ride['host_uid'], data['member_uid'])
+                    ).fetchone()
+                    meets_network = (network is not None) or (direct is not None)
+                if meets_rating and meets_vouches and meets_network:
                     status = 'accepted'
 
         cursor = db.execute(
@@ -545,19 +731,36 @@ def create_booking():
                 status,
             )
         )
+
         if status == 'accepted':
             db.execute(
                 'UPDATE rides SET available_seats=available_seats-1 WHERE id=?',
                 (data['ride_id'],)
             )
 
-        # Mark member's search as matched
         db.execute(
             "UPDATE member_searches SET status='matched' WHERE member_uid=?",
             (data['member_uid'],)
         )
-
         db.commit()
+
+        # Notify host
+        host_token = get_push_token(ride['host_uid'])
+        if status == 'accepted':
+            send_push_notification(
+                host_token,
+                '✅ New rider auto-accepted',
+                f'{data["member_name"]} joined your ride automatically.',
+                {'screen': 'HostDashboard'}
+            )
+        else:
+            send_push_notification(
+                host_token,
+                '🚗 New ride request',
+                f'{data["member_name"]} wants to join your ride. Tap to review.',
+                {'screen': 'HostDashboard'}
+            )
+
         return jsonify({'success': True, 'status': status, 'booking_id': cursor.lastrowid})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -566,7 +769,6 @@ def create_booking():
 
 @app.route('/bookings/host-invite', methods=['POST'])
 def host_invite_member():
-    """Host proactively picks a member from the browse list"""
     data = request.json
     db = get_db()
     try:
@@ -578,7 +780,10 @@ def host_invite_member():
         if existing:
             return jsonify({'error': 'Member already has a booking on this ride'}), 400
 
-        ride = db.execute('SELECT available_seats FROM rides WHERE id=?', (data['ride_id'],)).fetchone()
+        ride = db.execute(
+            'SELECT available_seats, host_uid FROM rides WHERE id=?',
+            (data['ride_id'],)
+        ).fetchone()
         if not ride or ride['available_seats'] <= 0:
             return jsonify({'error': 'No seats available'}), 400
 
@@ -603,6 +808,16 @@ def host_invite_member():
             (data['member_uid'],)
         )
         db.commit()
+
+        # Notify member they were invited
+        member_token = get_push_token(data['member_uid'])
+        send_push_notification(
+            member_token,
+            '🎉 You got picked!',
+            'A host has added you to their ride. Check your bookings.',
+            {'screen': 'MyBookings'}
+        )
+
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -642,21 +857,47 @@ def update_booking_status(booking_id):
     data = request.json
     db = get_db()
     try:
-        booking = db.execute('SELECT ride_id FROM bookings WHERE id=?', (booking_id,)).fetchone()
-        db.execute('UPDATE bookings SET status=? WHERE id=?', (data['status'], booking_id))
-        if data['status'] == 'accepted':
-            if booking:
-                db.execute(
-                    'UPDATE rides SET available_seats=available_seats-1 WHERE id=?',
-                    (booking['ride_id'],)
-                )
-        elif data['status'] == 'rejected':
-            if booking:
-                db.execute(
-                    'UPDATE rides SET available_seats=available_seats+1 WHERE id=?',
-                    (booking['ride_id'],)
-                )
+        booking = db.execute(
+            'SELECT ride_id, member_uid, member_name FROM bookings WHERE id=?',
+            (booking_id,)
+        ).fetchone()
+
+        db.execute(
+            'UPDATE bookings SET status=? WHERE id=?',
+            (data['status'], booking_id)
+        )
+
+        if data['status'] == 'accepted' and booking:
+            db.execute(
+                'UPDATE rides SET available_seats=available_seats-1 WHERE id=?',
+                (booking['ride_id'],)
+            )
+        elif data['status'] == 'rejected' and booking:
+            db.execute(
+                'UPDATE rides SET available_seats=available_seats+1 WHERE id=?',
+                (booking['ride_id'],)
+            )
+
         db.commit()
+
+        # Notify member
+        if booking:
+            member_token = get_push_token(booking['member_uid'])
+            if data['status'] == 'accepted':
+                send_push_notification(
+                    member_token,
+                    '✅ Ride confirmed!',
+                    'Your booking was accepted. Have a safe trip!',
+                    {'screen': 'MyBookings'}
+                )
+            elif data['status'] == 'rejected':
+                send_push_notification(
+                    member_token,
+                    '❌ Booking declined',
+                    'The host declined your request. Try another ride.',
+                    {'screen': 'MemberDashboard'}
+                )
+
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -699,7 +940,6 @@ def get_eco_stats(member_uid):
                FROM bookings WHERE member_uid=? AND status='accepted' ''',
             (member_uid,)
         ).fetchall()
-
         total_km = sum(
             haversine(r['pickup_lat'], r['pickup_lng'], r['drop_lat'], r['drop_lng'])
             for r in rows
@@ -707,16 +947,17 @@ def get_eco_stats(member_uid):
         co2_saved = round(total_km * 0.21, 1)
         fuel_saved = round(co2_saved / 2.31, 1)
         trees = round(co2_saved / 21, 2)
-
         return jsonify({
             'total_rides': len(rows),
             'co2_saved_kg': co2_saved,
             'fuel_saved_litres': fuel_saved,
             'trees_equivalent': trees,
         })
-    except Exception as e:
-        return jsonify({'total_rides': 0, 'co2_saved_kg': 0.0,
-                       'fuel_saved_litres': 0.0, 'trees_equivalent': 0.0})
+    except Exception:
+        return jsonify({
+            'total_rides': 0, 'co2_saved_kg': 0.0,
+            'fuel_saved_litres': 0.0, 'trees_equivalent': 0.0,
+        })
     finally:
         db.close()
 
